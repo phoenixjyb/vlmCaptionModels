@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision
+transformers>=4.37.0
+qwen-vl-utils
+pillow
+numpy
+accelerate
