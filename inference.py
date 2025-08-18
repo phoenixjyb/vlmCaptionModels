@@ -123,6 +123,33 @@ def load_blip2_model(model_name: str):
         logger.error(f"Failed to load BLIP2 model: {e}")
         raise
 
+def load_vitgpt2_model(model_name: str):
+    """Load ViT-GPT2 image captioning model (lightweight)."""
+    try:
+        from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+        import torch
+        import os
+
+        if model_name == "auto" or model_name == "default":
+            model_name = "nlpconnect/vit-gpt2-image-captioning"
+
+        logger.info(f"Loading ViT-GPT2 image captioning model: {model_name}")
+
+        model = VisionEncoderDecoderModel.from_pretrained(model_name)
+        feature_extractor = ViTImageProcessor.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+
+        return (model, {"fe": feature_extractor, "tok": tokenizer, "device": device}, model_name)
+    except ImportError as e:
+        logger.error("Failed to import ViT-GPT2 dependencies. Install with: pip install transformers torch pillow")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load ViT-GPT2 model: {e}")
+        raise
+
 def generate_qwen2vl_caption(model, processor, image, model_name: str) -> str:
     """Generate caption using Qwen2.5-VL."""
     import torch
@@ -194,6 +221,25 @@ def generate_blip2_caption(model, processor, image, model_name: str) -> str:
     caption = processor.decode(out[0], skip_special_tokens=True).strip()
     return caption
 
+def generate_vitgpt2_caption(model, proc_bundle, image, model_name: str) -> str:
+    """Generate caption using ViT-GPT2 (lightweight)."""
+    import torch
+
+    fe = proc_bundle["fe"]
+    tok = proc_bundle["tok"]
+    device = proc_bundle["device"]
+
+    # Preprocess image
+    pixel_values = fe(images=image, return_tensors="pt").pixel_values.to(device)
+
+    # Generate ids
+    with torch.no_grad():
+        output_ids = model.generate(pixel_values, max_length=32, num_beams=4)
+
+    # Decode
+    caption = tok.decode(output_ids[0], skip_special_tokens=True).strip()
+    return caption
+
 def process_vision_info(messages):
     """Process vision info for Qwen2VL."""
     image_inputs = []
@@ -226,6 +272,9 @@ def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
     elif provider == "blip2":
         model, processor, actual_model_name = load_blip2_model(model_name)
         caption = generate_blip2_caption(model, processor, image, actual_model_name)
+    elif provider == "vitgpt2":
+        model, proc_bundle, actual_model_name = load_vitgpt2_model(model_name)
+        caption = generate_vitgpt2_caption(model, proc_bundle, image, actual_model_name)
     else:
         raise ValueError(f"Unknown provider: {provider}")
     
@@ -239,7 +288,7 @@ def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate image captions using various VLM models")
-    parser.add_argument("--provider", required=True, choices=["qwen2.5-vl", "llava-next", "blip2"],
+    parser.add_argument("--provider", required=True, choices=["qwen2.5-vl", "llava-next", "blip2", "vitgpt2"],
                         help="Caption model provider to use")
     parser.add_argument("--model", default="auto", 
                         help="Model name or 'auto' for default")
