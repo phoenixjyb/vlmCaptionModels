@@ -8,6 +8,7 @@ import json
 import sys
 import base64
 import io
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 import torch
@@ -19,34 +20,57 @@ class BLIP2Inference:
     def __init__(self, model_id: str = "Salesforce/blip2-opt-2.7b"):
         """Initialize BLIP2 model for inference."""
         self.model_id = model_id
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        
+        # Get GPU device from environment or default to RTX 3090 (cuda:1)
+        gpu_device = os.environ.get('CAPTION_GPU_DEVICE', '1')
+        
         if torch.cuda.is_available():
-            torch.cuda.set_device(0)
+            self.device = torch.device(f"cuda:{gpu_device}")
+            torch.cuda.set_device(int(gpu_device))
+            print(f"Using GPU device: cuda:{gpu_device} ({torch.cuda.get_device_name(int(gpu_device))})", file=sys.stderr)
+        else:
+            self.device = torch.device("cpu")
+            print("CUDA not available, using CPU", file=sys.stderr)
+            
         self.model = None
         self.processor = None
         
     def load_model(self):
         """Load the BLIP2 model."""
         try:
-            print("Loading BLIP2 model...", file=sys.stderr)
+            print(f"Loading BLIP2 model on {self.device}...", file=sys.stderr)
             
             # Load processor
             self.processor = Blip2Processor.from_pretrained(self.model_id)
             
-            # Load model
-            self.model = Blip2ForConditionalGeneration.from_pretrained(
-                self.model_id,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                device_map="auto" if self.device == "cuda" else None
-            )
-            
-            if self.device == "cpu":
+            # Load model with proper device mapping
+            if self.device.type == "cuda":
+                # Use specific GPU device for RTX 3090
+                self.model = Blip2ForConditionalGeneration.from_pretrained(
+                    self.model_id,
+                    torch_dtype=torch.float16,  # Use float16 for better VRAM efficiency
+                    device_map={"": self.device}  # Force to specific GPU
+                )
+            else:
+                # CPU fallback
+                self.model = Blip2ForConditionalGeneration.from_pretrained(
+                    self.model_id,
+                    torch_dtype=torch.float32
+                )
                 self.model = self.model.to(self.device)
                 
             # Set to evaluation mode
             self.model.eval()
             
-            print("BLIP2 model loaded successfully!", file=sys.stderr)
+            # Print VRAM usage if on CUDA
+            if self.device.type == "cuda":
+                gpu_id = self.device.index
+                vram_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+                vram_reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3
+                print(f"BLIP2 loaded successfully! VRAM usage: {vram_allocated:.1f}GB allocated, {vram_reserved:.1f}GB reserved", file=sys.stderr)
+            else:
+                print("BLIP2 model loaded successfully on CPU!", file=sys.stderr)
+                
             return True
         except Exception as e:
             print(f"Error loading BLIP2 model: {e}", file=sys.stderr)

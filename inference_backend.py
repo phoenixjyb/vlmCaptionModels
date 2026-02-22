@@ -37,8 +37,14 @@ def main() -> None:
         cmd += ["--prompt", args.prompt]
 
     env = os.environ.copy()
+    
+    # Set GPU device preference for RTX 3090
     if args.device:
         env["CAPTION_DEVICE"] = args.device
+    
+    # Force RTX 3090 usage if available
+    env["PYTORCH_CUDA_DEVICE"] = env.get("PYTORCH_CUDA_DEVICE", "1")  # Default to RTX 3090
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     # Relay output 1:1 and preserve exit code; avoid Windows codepage issues
     proc = subprocess.run(
