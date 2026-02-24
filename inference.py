@@ -20,8 +20,8 @@ python inference.py --provider qwen2.5-vl --model auto --image /path/to/image.pn
 Expected JSON output format:
 {
     "caption": "A detailed description of the image",
-    "model": "qwen2.5-vl-7b-instruct",
-    "provider": "qwen2.5-vl"
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "provider": "qwen3-vl"
 }
 """
 
@@ -134,7 +134,7 @@ def validate_rtx3090_usage():
 def load_qwen2vl_model(model_name: str):
     """Load Qwen2.5-VL model."""
     try:
-        from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+        from transformers import AutoProcessor, AutoConfig
         import torch
         import os
         
@@ -142,18 +142,98 @@ def load_qwen2vl_model(model_name: str):
         validate_rtx3090_usage()
         
         if model_name == "auto" or model_name == "default":
-            # Use absolute path to local model
+            # Priority: explicit env -> local qwen3 8b -> local qwen2.5 7b -> local qwen2.5 3b -> HF qwen3 8b
+            env_model = os.getenv("QWEN2VL_MODEL_NAME", "").strip()
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            model_name = os.path.join(script_dir, "models", "qwen2.5-vl-3b-instruct")
+            local_qwen3_8b = os.path.join(script_dir, "models", "qwen3-vl-8b-instruct")
+            local_7b = os.path.join(script_dir, "models", "qwen2.5-vl-7b-instruct")
+            local_3b = os.path.join(script_dir, "models", "qwen2.5-vl-3b-instruct")
+            if env_model:
+                model_name = env_model
+            elif os.path.isdir(local_qwen3_8b):
+                model_name = local_qwen3_8b
+            elif os.path.isdir(local_7b):
+                model_name = local_7b
+            elif os.path.isdir(local_3b):
+                model_name = local_3b
+            else:
+                model_name = "Qwen/Qwen3-VL-8B-Instruct"
         
-        logger.info(f"Loading Qwen2.5-VL model: {model_name}")
-        
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu"
-        )
-        processor = AutoProcessor.from_pretrained(model_name)
+        logger.info(f"Loading Qwen VL model: {model_name}")
+
+        # Resolve the most suitable Qwen VL class for the model config.
+        model_type = None
+        try:
+            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            model_type = getattr(cfg, "model_type", None)
+        except Exception as e:
+            logger.warning(f"Could not resolve model_type from config: {e}")
+
+        class_candidates = []
+        if model_type == "qwen3_vl":
+            class_candidates = [
+                "Qwen3VLForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen2VLForConditionalGeneration",
+            ]
+        elif model_type == "qwen2_5_vl":
+            class_candidates = [
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen2VLForConditionalGeneration",
+            ]
+        else:
+            class_candidates = [
+                "Qwen3VLForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen2VLForConditionalGeneration",
+            ]
+
+        _QwenModel = None
+        _qwen_model_class = None
+        import transformers as _tf
+        for class_name in class_candidates:
+            if hasattr(_tf, class_name):
+                _QwenModel = getattr(_tf, class_name)
+                _qwen_model_class = class_name
+                break
+        if _QwenModel is None:
+            raise RuntimeError("No compatible Qwen VL model class found in transformers")
+
+        logger.info(f"Using transformer class: {_qwen_model_class} (model_type={model_type})")
+        use_4bit = os.getenv("QWEN2VL_LOAD_IN_4BIT", "true").lower() in ("1", "true", "yes")
+        quant_type = os.getenv("QWEN2VL_4BIT_QUANT_TYPE", "nf4").strip() or "nf4"
+        bnb_ok = False
+        quantization_config = None
+        if use_4bit and _gpu_device is not None:
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type=quant_type,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                bnb_ok = True
+                logger.info(f"Using 4-bit quantization (type={quant_type})")
+            except Exception as e:
+                logger.warning(f"4-bit requested but BitsAndBytesConfig unavailable: {e}. Falling back to non-4bit.")
+
+        if bnb_ok and quantization_config is not None:
+            model = _QwenModel.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map=f"cuda:{_gpu_device}",
+                trust_remote_code=True,
+            )
+        else:
+            model = _QwenModel.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu",
+                trust_remote_code=True,
+            )
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         
         return model, processor, model_name
         
@@ -161,7 +241,7 @@ def load_qwen2vl_model(model_name: str):
         logger.error("Failed to import Qwen2VL dependencies. Install with: pip install transformers torch qwen-vl-utils")
         raise
     except Exception as e:
-        logger.error(f"Failed to load Qwen2.5-VL model: {e}")
+        logger.error(f"Failed to load Qwen VL model: {e}")
         raise
 
 def load_llava_next_model(model_name: str):
@@ -282,29 +362,52 @@ def generate_qwen2vl_caption(model, processor, image, model_name: str) -> str:
     
     # Process inputs
     image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt"
-    )
+    proc_kwargs = {
+        "text": [text],
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    if image_inputs:
+        proc_kwargs["images"] = image_inputs
+    if video_inputs:
+        proc_kwargs["videos"] = video_inputs
+    inputs = processor(**proc_kwargs)
     inputs = inputs.to(model.device)
     
     # Generate response
     with torch.no_grad():
         generated_ids = model.generate(**inputs, max_new_tokens=200)
-    
-    # Trim input tokens and decode
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    
+
+    # Decode robustly across transformer output shape variations.
+    if hasattr(generated_ids, "ndim") and generated_ids.ndim == 1:
+        generated_ids = generated_ids.unsqueeze(0)
+
+    trimmed = []
+    try:
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids):
+            start = int(len(in_ids))
+            if int(len(out_ids)) > start:
+                trimmed.append(out_ids[start:])
+            else:
+                trimmed.append(out_ids)
+    except Exception:
+        trimmed = []
+
+    if not trimmed:
+        trimmed = generated_ids
+
     output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    
-    return output_text[0].strip()
+    caption = (output_text[0] if output_text else "").strip()
+    if caption:
+        return caption
+
+    # Fallback: decode without trimming if response is empty
+    fallback = processor.batch_decode(
+        generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    return (fallback[0] if fallback else "").strip()
 
 def generate_llava_next_caption(model, processor, image, model_name: str) -> str:
     """Generate caption using LLaVA-NeXT."""
@@ -375,7 +478,8 @@ def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
     logger.info(f"Loaded image: {image_path} ({image.size})")
     
     # Load model and generate caption based on provider
-    if provider == "qwen2.5-vl":
+    provider = (provider or "").lower()
+    if provider in ("qwen2.5-vl", "qwen3-vl", "qwen3", "qwen2-vl", "qwen"):
         model, processor, actual_model_name = load_qwen2vl_model(model_name)
         caption = generate_qwen2vl_caption(model, processor, image, actual_model_name)
     elif provider == "llava-next":
@@ -400,7 +504,7 @@ def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate image captions using various VLM models")
-    parser.add_argument("--provider", required=True, choices=["qwen2.5-vl", "llava-next", "blip2", "vitgpt2"],
+    parser.add_argument("--provider", required=True, choices=["qwen2.5-vl", "qwen3-vl", "qwen3", "qwen2-vl", "qwen", "llava-next", "blip2", "vitgpt2"],
                         help="Caption model provider to use")
     parser.add_argument("--model", default="auto", 
                         help="Model name or 'auto' for default")

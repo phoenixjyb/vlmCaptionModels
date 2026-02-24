@@ -55,6 +55,7 @@ def main() -> None:
         encoding="utf-8",
         errors="replace",
         timeout=600,
+        env=env,
     )
 
     if proc.stdout:
