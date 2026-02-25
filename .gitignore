@@ -16,3 +16,4 @@ models/qwen2.5-vl-3b-instruct/
 __pycache__/
 *.pyc
 *.pyo
+caption_server*.log
