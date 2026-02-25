@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import argparse
+import asyncio
 import logging
 import time
 import uvicorn
@@ -25,12 +26,36 @@ from PIL import Image
 import io
 import os
 
+# Help reduce CUDA memory fragmentation for long-running caption workloads.
+if not os.getenv("PYTORCH_CUDA_ALLOC_CONF"):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+
 # Runtime configuration for VRAM usage control
 _vram_mode = os.getenv("CAPTION_VRAM_MODE", "balanced").lower()  # balanced|full|auto|cpu
 try:
     _max_gpu_gb = int(os.getenv("CAPTION_MAX_GPU_GB", "12"))
 except Exception:
     _max_gpu_gb = 12
+try:
+    _qwen_max_new_tokens = int(os.getenv("QWEN2VL_MAX_NEW_TOKENS", "96"))
+except Exception:
+    _qwen_max_new_tokens = 96
+try:
+    _qwen_max_image_edge = int(os.getenv("QWEN2VL_MAX_IMAGE_EDGE", "1280"))
+except Exception:
+    _qwen_max_image_edge = 1280
+try:
+    _qwen_oom_retry_edge = int(os.getenv("QWEN2VL_OOM_RETRY_EDGE", "960"))
+except Exception:
+    _qwen_oom_retry_edge = 960
+try:
+    _qwen_oom_retry_tokens = int(os.getenv("QWEN2VL_OOM_RETRY_TOKENS", "64"))
+except Exception:
+    _qwen_oom_retry_tokens = 64
+try:
+    _caption_max_concurrency = max(1, int(os.getenv("CAPTION_SERVER_MAX_CONCURRENCY", "1")))
+except Exception:
+    _caption_max_concurrency = 1
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,6 +66,7 @@ _model_cache = {}
 _gpu_device = None
 _active_provider = os.getenv("CAPTION_HTTP_PROVIDER", "qwen3-vl").lower()
 _active_model_name = os.getenv("CAPTION_HTTP_MODEL", "auto")
+_caption_semaphore = asyncio.Semaphore(_caption_max_concurrency)
 
 app = FastAPI(title="Caption Models Service", version="1.0.0")
 
@@ -92,6 +118,42 @@ def resolve_qwen_model_name(model_name: str) -> str:
     if os.path.isdir(local_3b):
         return local_3b
     return "Qwen/Qwen3-VL-8B-Instruct"
+
+
+def _resample_lanczos():
+    try:
+        return Image.Resampling.LANCZOS  # Pillow>=9
+    except Exception:  # pragma: no cover
+        return Image.LANCZOS
+
+
+def _resize_for_qwen(image: Image.Image, max_edge: int) -> Image.Image:
+    if max_edge <= 0:
+        return image
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= max_edge:
+        return image
+    scale = float(max_edge) / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = image.resize((new_w, new_h), _resample_lanczos())
+    logger.info(f"Resized caption image from {w}x{h} to {new_w}x{new_h} to control VRAM")
+    return resized
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("out of memory" in msg) or ("cuda oom" in msg)
+
+
+def _clear_cuda_cache() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 def configure_gpu():
     """Configure GPU device to use RTX 3090 exclusively."""
@@ -363,9 +425,9 @@ def generate_blip2_caption(image: Image.Image) -> str:
 
 def generate_qwen2vl_caption(image: Image.Image) -> str:
     """Generate caption using Qwen2.5-VL."""
-    try:
-        import torch
+    import torch
 
+    def _run_once(work_image: Image.Image, max_new_tokens: int) -> str:
         model_info = load_qwen2vl_model()
         model = model_info["model"]
         processor = model_info["processor"]
@@ -375,7 +437,7 @@ def generate_qwen2vl_caption(image: Image.Image) -> str:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image},
+                    {"type": "image", "image": work_image},
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -394,32 +456,50 @@ def generate_qwen2vl_caption(image: Image.Image) -> str:
 
         inputs = processor(**proc_kwargs)
         inputs = inputs.to(model.device)
-
-        with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=200)
-
-        if hasattr(generated_ids, "ndim") and generated_ids.ndim == 1:
-            generated_ids = generated_ids.unsqueeze(0)
-
-        trimmed = []
         try:
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids):
-                start = int(len(in_ids))
-                trimmed.append(out_ids[start:] if int(len(out_ids)) > start else out_ids)
-        except Exception:
-            trimmed = generated_ids
+            with torch.inference_mode():
+                generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-        decoded = processor.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        caption = (decoded[0] if decoded else "").strip()
-        if caption:
-            return caption
-        fallback = processor.batch_decode(
-            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        return (fallback[0] if fallback else "").strip()
+            if hasattr(generated_ids, "ndim") and generated_ids.ndim == 1:
+                generated_ids = generated_ids.unsqueeze(0)
+
+            trimmed = []
+            try:
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids):
+                    start = int(len(in_ids))
+                    trimmed.append(out_ids[start:] if int(len(out_ids)) > start else out_ids)
+            except Exception:
+                trimmed = generated_ids
+
+            decoded = processor.batch_decode(
+                trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            caption = (decoded[0] if decoded else "").strip()
+            if caption:
+                return caption
+            fallback = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            return (fallback[0] if fallback else "").strip()
+        finally:
+            try:
+                del inputs
+            except Exception:
+                pass
+
+    work_image = _resize_for_qwen(image, _qwen_max_image_edge)
+    try:
+        return _run_once(work_image, max_new_tokens=max(16, int(_qwen_max_new_tokens)))
     except Exception as e:
+        if _is_cuda_oom(e):
+            retry_edge = max(512, min(_qwen_max_image_edge, _qwen_oom_retry_edge))
+            retry_tokens = max(16, min(int(_qwen_max_new_tokens), int(_qwen_oom_retry_tokens)))
+            logger.warning(
+                f"Qwen OOM on first attempt. Retrying with edge={retry_edge}, max_new_tokens={retry_tokens}"
+            )
+            _clear_cuda_cache()
+            retry_image = _resize_for_qwen(work_image, retry_edge)
+            return _run_once(retry_image, max_new_tokens=retry_tokens)
         logger.error(f"❌ Qwen caption generation failed: {e}")
         raise
 
@@ -434,6 +514,11 @@ async def startup_event():
         _active_provider = "blip2"
     logger.info("🚀 Starting Caption Models Service...")
     logger.info(f"Provider: {_active_provider} | Model: {_active_model_name}")
+    logger.info(
+        f"Runtime tuning: max_concurrency={_caption_max_concurrency}, "
+        f"qwen_max_edge={_qwen_max_image_edge}, qwen_max_new_tokens={_qwen_max_new_tokens}, "
+        f"oom_retry_edge={_qwen_oom_retry_edge}, oom_retry_tokens={_qwen_oom_retry_tokens}"
+    )
 
     # Configure GPU
     configure_gpu()
@@ -461,14 +546,15 @@ async def generate_caption_endpoint(file: UploadFile = File(...)):
         image_data = await file.read()
         image = Image.open(io.BytesIO(image_data)).convert('RGB')
         
-        start_time = time.time()
-        if _is_qwen_provider(_active_provider):
-            caption = generate_qwen2vl_caption(image)
-            model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name))
-        else:
-            caption = generate_blip2_caption(image)
-            model_name = "blip2-opt-2.7b"
-        generation_time = time.time() - start_time
+        async with _caption_semaphore:
+            start_time = time.time()
+            if _is_qwen_provider(_active_provider):
+                caption = generate_qwen2vl_caption(image)
+                model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name))
+            else:
+                caption = generate_blip2_caption(image)
+                model_name = "blip2-opt-2.7b"
+            generation_time = time.time() - start_time
         
         return {
             "caption": caption,
@@ -480,6 +566,9 @@ async def generate_caption_endpoint(file: UploadFile = File(...)):
         
     except Exception as e:
         logger.error(f"Caption generation error: {e}")
+        if _is_cuda_oom(e):
+            _clear_cuda_cache()
+            raise HTTPException(status_code=503, detail=f"CUDA out of memory: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
