@@ -22,6 +22,7 @@ import time
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from PIL import Image
 import io
 import os
@@ -68,6 +69,13 @@ _active_provider = os.getenv("CAPTION_HTTP_PROVIDER", "qwen3-vl").lower()
 _active_model_name = os.getenv("CAPTION_HTTP_MODEL", "auto")
 _caption_semaphore = asyncio.Semaphore(_caption_max_concurrency)
 
+
+class TranslationRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    source_lang: str = Field(default="en")
+    target_lang: str = Field(default="zh-CN")
+    style: str = Field(default="caption")
+
 app = FastAPI(title="Caption Models Service", version="1.0.0")
 
 # CORS middleware for cross-origin requests
@@ -101,7 +109,7 @@ def _provider_cache_key(provider: str) -> str:
     return provider
 
 
-def resolve_qwen_model_name(model_name: str) -> str:
+def resolve_qwen_model_name(model_name: str, provider: str | None = None) -> str:
     if model_name and model_name not in ("auto", "default"):
         return model_name
     env_model = os.getenv("QWEN2VL_MODEL_NAME", "").strip()
@@ -111,6 +119,17 @@ def resolve_qwen_model_name(model_name: str) -> str:
     local_3b = os.path.join(script_dir, "models", "qwen2.5-vl-3b-instruct")
     if env_model:
         return env_model
+    active = normalize_provider(provider or _active_provider)
+    if active == "qwen3-vl":
+        if os.path.isdir(local_qwen3_8b):
+            return local_qwen3_8b
+        return os.getenv("QWEN3VL_MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct")
+    if active == "qwen2.5-vl":
+        if os.path.isdir(local_7b):
+            return local_7b
+        if os.path.isdir(local_3b):
+            return local_3b
+        return os.getenv("QWEN25VL_MODEL_NAME", "Qwen/Qwen2.5-VL-7B-Instruct")
     if os.path.isdir(local_qwen3_8b):
         return local_qwen3_8b
     if os.path.isdir(local_7b):
@@ -283,7 +302,7 @@ def load_qwen2vl_model():
         from transformers import AutoProcessor, AutoConfig
         import transformers as _tf
 
-        model_name = resolve_qwen_model_name(_active_model_name)
+        model_name = resolve_qwen_model_name(_active_model_name, _active_provider)
         logger.info(f"Loading Qwen VL model from: {model_name}")
         start_time = time.time()
 
@@ -503,6 +522,75 @@ def generate_qwen2vl_caption(image: Image.Image) -> str:
         logger.error(f"❌ Qwen caption generation failed: {e}")
         raise
 
+
+def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", target_lang: str = "zh-CN", style: str = "caption") -> str:
+    """Translate caption text with Qwen VL in text-only mode."""
+    import torch
+
+    clean_text = (text_to_translate or "").strip()
+    if not clean_text:
+        return ""
+
+    max_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_MAX_NEW_TOKENS", "160") or "160"))
+    retry_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_OOM_RETRY_TOKENS", "96") or "96"))
+    prompt = (
+        f"Translate the following {source_lang} {style} into natural {target_lang}. "
+        "Return only the translated text without explanations.\n\n"
+        f"{clean_text}"
+    )
+
+    def _run_once(tokens: int) -> str:
+        model_info = load_qwen2vl_model()
+        model = model_info["model"]
+        processor = model_info["processor"]
+
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            }
+        ]
+        rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[rendered], padding=True, return_tensors="pt")
+        inputs = inputs.to(model.device)
+        try:
+            with torch.inference_mode():
+                generated_ids = model.generate(**inputs, max_new_tokens=tokens)
+            if hasattr(generated_ids, "ndim") and generated_ids.ndim == 1:
+                generated_ids = generated_ids.unsqueeze(0)
+            trimmed = []
+            try:
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids):
+                    start = int(len(in_ids))
+                    trimmed.append(out_ids[start:] if int(len(out_ids)) > start else out_ids)
+            except Exception:
+                trimmed = generated_ids
+
+            decoded = processor.batch_decode(
+                trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            out = (decoded[0] if decoded else "").strip()
+            if not out:
+                fallback = processor.batch_decode(
+                    generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )
+                out = (fallback[0] if fallback else "").strip()
+            return out.strip().strip("\"").strip()
+        finally:
+            try:
+                del inputs
+            except Exception:
+                pass
+
+    try:
+        return _run_once(max_tokens)
+    except Exception as e:
+        if _is_cuda_oom(e):
+            logger.warning(f"Qwen translation OOM. Retrying with max_new_tokens={retry_tokens}")
+            _clear_cuda_cache()
+            return _run_once(min(max_tokens, retry_tokens))
+        raise
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize the service on startup."""
@@ -550,7 +638,7 @@ async def generate_caption_endpoint(file: UploadFile = File(...)):
             start_time = time.time()
             if _is_qwen_provider(_active_provider):
                 caption = generate_qwen2vl_caption(image)
-                model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name))
+                model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name, _active_provider))
             else:
                 caption = generate_blip2_caption(image)
                 model_name = "blip2-opt-2.7b"
@@ -566,6 +654,40 @@ async def generate_caption_endpoint(file: UploadFile = File(...)):
         
     except Exception as e:
         logger.error(f"Caption generation error: {e}")
+        if _is_cuda_oom(e):
+            _clear_cuda_cache()
+            raise HTTPException(status_code=503, detail=f"CUDA out of memory: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/translate")
+async def translate_text_endpoint(req: TranslationRequest):
+    """Translate text using the loaded Qwen model."""
+    if not _is_qwen_provider(_active_provider):
+        raise HTTPException(status_code=400, detail="Translation requires qwen provider")
+    try:
+        async with _caption_semaphore:
+            start_time = time.time()
+            translated = generate_qwen_translation(
+                req.text,
+                source_lang=req.source_lang,
+                target_lang=req.target_lang,
+                style=req.style,
+            )
+            generation_time = time.time() - start_time
+            if not translated:
+                raise RuntimeError("Empty translation output")
+        return {
+            "translation": translated,
+            "source_lang": req.source_lang,
+            "target_lang": req.target_lang,
+            "provider": _active_provider,
+            "model": _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name, _active_provider)),
+            "generation_time_seconds": round(generation_time, 2),
+            "device": f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu",
+        }
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
         if _is_cuda_oom(e):
             _clear_cuda_cache()
             raise HTTPException(status_code=503, detail=f"CUDA out of memory: {e}")
@@ -634,6 +756,7 @@ async def root():
         "active_provider": _active_provider,
         "endpoints": [
             "POST /caption - Generate caption for image",
+            "POST /translate - Translate text with Qwen",
             "GET /health - Service health check",
             "GET /model-info - Model information"
         ]
