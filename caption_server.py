@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image
@@ -378,6 +378,12 @@ def load_qwen2vl_model():
 
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         load_time = time.time() - start_time
+        try:
+            model_memory_bytes = int(model.get_memory_footprint())
+        except Exception:
+            model_memory_bytes = None
+        loaded_in_4bit = bool(getattr(model, "is_loaded_in_4bit", quantization_config is not None))
+        _clear_cuda_cache()
         logger.info(f"✅ Qwen VL model loaded in {load_time:.1f}s ({qwen_class})")
 
         _model_cache[cache_key] = {
@@ -387,8 +393,9 @@ def load_qwen2vl_model():
             "load_time": load_time,
             "device": f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu",
             "model_class": qwen_class,
-            "load_in_4bit": bool(quantization_config is not None),
-            "quant_type": quant_type if quantization_config is not None else None,
+            "load_in_4bit": loaded_in_4bit,
+            "quant_type": quant_type if loaded_in_4bit else None,
+            "model_memory_bytes": model_memory_bytes,
         }
         return _model_cache[cache_key]
     except Exception as e:
@@ -442,7 +449,7 @@ def generate_blip2_caption(image: Image.Image) -> str:
         raise
 
 
-def generate_qwen2vl_caption(image: Image.Image) -> str:
+def generate_qwen2vl_caption(image: Image.Image, prompt: str | None = None) -> str:
     """Generate caption using Qwen2.5-VL."""
     import torch
 
@@ -451,13 +458,13 @@ def generate_qwen2vl_caption(image: Image.Image) -> str:
         model = model_info["model"]
         processor = model_info["processor"]
 
-        prompt = os.getenv("QWEN2VL_PROMPT", "Describe this image in detail.")
+        effective_prompt = (prompt or os.getenv("QWEN2VL_PROMPT", "Describe this image in detail.")).strip()
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": work_image},
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": effective_prompt},
                 ],
             }
         ]
@@ -502,9 +509,18 @@ def generate_qwen2vl_caption(image: Image.Image) -> str:
             return (fallback[0] if fallback else "").strip()
         finally:
             try:
+                del generated_ids
+            except Exception:
+                pass
+            try:
+                del trimmed
+            except Exception:
+                pass
+            try:
                 del inputs
             except Exception:
                 pass
+            _clear_cuda_cache()
 
     work_image = _resize_for_qwen(image, _qwen_max_image_edge)
     try:
@@ -578,9 +594,18 @@ def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", t
             return out.strip().strip("\"").strip()
         finally:
             try:
+                del generated_ids
+            except Exception:
+                pass
+            try:
+                del trimmed
+            except Exception:
+                pass
+            try:
                 del inputs
             except Exception:
                 pass
+            _clear_cuda_cache()
 
     try:
         return _run_once(max_tokens)
@@ -623,7 +648,10 @@ async def startup_event():
         # Don't fail startup, allow lazy loading
 
 @app.post("/caption")
-async def generate_caption_endpoint(file: UploadFile = File(...)):
+async def generate_caption_endpoint(
+    file: UploadFile = File(...),
+    prompt: str | None = Form(default=None),
+):
     """Generate caption for uploaded image."""
     try:
         # Validate file type
@@ -637,7 +665,7 @@ async def generate_caption_endpoint(file: UploadFile = File(...)):
         async with _caption_semaphore:
             start_time = time.time()
             if _is_qwen_provider(_active_provider):
-                caption = generate_qwen2vl_caption(image)
+                caption = generate_qwen2vl_caption(image, prompt=prompt)
                 model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name, _active_provider))
             else:
                 caption = generate_blip2_caption(image)
@@ -702,11 +730,15 @@ async def health_check():
         gpu_available = torch.cuda.is_available()
         gpu_device = None
         gpu_memory = None
+        gpu_allocated_bytes = None
+        gpu_reserved_bytes = None
         
         if gpu_available and _gpu_device is not None:
             gpu_device = torch.cuda.get_device_name(_gpu_device)
             props = torch.cuda.get_device_properties(_gpu_device)
             gpu_memory = f"{props.total_memory / 1024**3:.1f} GB"
+            gpu_allocated_bytes = int(torch.cuda.memory_allocated(_gpu_device))
+            gpu_reserved_bytes = int(torch.cuda.memory_reserved(_gpu_device))
         
         model_loaded = _provider_cache_key(_active_provider) in _model_cache
         
@@ -717,6 +749,8 @@ async def health_check():
             "gpu_available": gpu_available,
             "gpu_device": gpu_device,
             "gpu_memory": gpu_memory,
+            "gpu_allocated_bytes": gpu_allocated_bytes,
+            "gpu_reserved_bytes": gpu_reserved_bytes,
             "current_device": f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu",
             "model_cache_ready": model_loaded
         }
@@ -745,6 +779,7 @@ async def model_info():
         "model_class": model_info.get("model_class"),
         "load_in_4bit": model_info.get("load_in_4bit"),
         "quant_type": model_info.get("quant_type"),
+        "model_memory_bytes": model_info.get("model_memory_bytes"),
     }
 
 @app.get("/")

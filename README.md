@@ -17,18 +17,21 @@ This directory was created with the setup script and contains:
 To use this external setup, set the environment variable:
 ```bash
 export CAPTION_EXTERNAL_DIR=H:\wSpace\vlm-photo-engine\vlmCaptionModels
-export CAPTION_PROVIDER=qwen2.5-vl
+export CAPTION_PROVIDER=qwen3-vl
+export QWEN2VL_MODEL_NAME=H:\wSpace\vlm-photo-engine\vlmCaptionModels\models\qwen3-vl-8b-instruct
 ```
 
 Or in your .env file:
 ```
 CAPTION_EXTERNAL_DIR=H:\wSpace\vlm-photo-engine\vlmCaptionModels
-CAPTION_PROVIDER=qwen2.5-vl
+CAPTION_PROVIDER=qwen3-vl
+QWEN2VL_MODEL_NAME=H:\wSpace\vlm-photo-engine\vlmCaptionModels\models\qwen3-vl-8b-instruct
 ```
 
 ## Supported Providers
 
-- `qwen2-vl` - Qwen2.5-VL models (recommended for latest performance)
+- `qwen3-vl` - Qwen3-VL models (recommended for the RTX 3090 quality path)
+- `qwen2.5-vl` - Qwen2.5-VL compatibility path
 - `llava-next` - LLaVA-NeXT models  
 - `blip2` - BLIP2 baseline models
 
@@ -47,7 +50,7 @@ pip install <additional-packages>
 Test the setup with:
 ```bash
 cd H:\wSpace\vlm-photo-engine\vlmCaptionModels
-.venv/bin/python inference.py --provider qwen2.5-vl --model auto --image /path/to/test/image.jpg
+.venv/bin/python inference.py --provider qwen3-vl --model models/qwen3-vl-8b-instruct --image /path/to/test/image.jpg
 ```
 
 ## Model Storage
@@ -58,3 +61,9 @@ Models will be automatically downloaded to:
 - Or system-wide cache directory
 
 Large models (7B+) require significant disk space and memory.
+
+The preferred Windows model location is
+`models/qwen3-vl-8b-instruct`. Keep the full checkpoint on Windows and load it
+with 4-bit quantization for the 24 GB RTX 3090. The HTTP service accepts an
+optional `prompt` form field on `POST /caption`; `QWEN2VL_PROMPT` remains the
+service-level fallback.
