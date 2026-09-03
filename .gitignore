@@ -1,6 +1,8 @@
 # Ignore large model weights and caches
 models/blip2-opt-2.7b/
 models/qwen2.5-vl-3b-instruct/
+models/qwen3-vl-8b-instruct/
+models/qwen3-vl-8b-download*.log
 .cache/
 
 # Virtual environment

@@ -342,17 +342,19 @@ def load_vitgpt2_model(model_name: str):
         logger.error(f"Failed to load ViT-GPT2 model: {e}")
         raise
 
-def generate_qwen2vl_caption(model, processor, image, model_name: str) -> str:
+def generate_qwen2vl_caption(model, processor, image, model_name: str, prompt: str | None = None) -> str:
     """Generate caption using Qwen2.5-VL."""
     import torch
     
+    effective_prompt = (prompt or os.getenv("QWEN2VL_PROMPT", "Describe this image in detail.")).strip()
+
     # Prepare conversation message
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": "Describe this image in detail."}
+                {"type": "text", "text": effective_prompt}
             ]
         }
     ]
@@ -409,11 +411,12 @@ def generate_qwen2vl_caption(model, processor, image, model_name: str) -> str:
     )
     return (fallback[0] if fallback else "").strip()
 
-def generate_llava_next_caption(model, processor, image, model_name: str) -> str:
+def generate_llava_next_caption(model, processor, image, model_name: str, prompt: str | None = None) -> str:
     """Generate caption using LLaVA-NeXT."""
     import torch
     
-    prompt = "[INST] <image>\nDescribe this image in detail. [/INST]"
+    request = (prompt or "Describe this image in detail.").strip()
+    prompt = f"[INST] <image>\n{request} [/INST]"
     
     inputs = processor(prompt, image, return_tensors="pt").to(model.device)
     
@@ -470,7 +473,7 @@ def process_vision_info(messages):
     
     return image_inputs, video_inputs
 
-def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
+def generate_caption(provider: str, model_name: str, image_path: str, prompt: str | None = None) -> dict:
     """Generate caption for an image using the specified provider."""
     
     # Load image
@@ -481,10 +484,10 @@ def generate_caption(provider: str, model_name: str, image_path: str) -> dict:
     provider = (provider or "").lower()
     if provider in ("qwen2.5-vl", "qwen3-vl", "qwen3", "qwen2-vl", "qwen"):
         model, processor, actual_model_name = load_qwen2vl_model(model_name)
-        caption = generate_qwen2vl_caption(model, processor, image, actual_model_name)
+        caption = generate_qwen2vl_caption(model, processor, image, actual_model_name, prompt=prompt)
     elif provider == "llava-next":
         model, processor, actual_model_name = load_llava_next_model(model_name)
-        caption = generate_llava_next_caption(model, processor, image, actual_model_name)
+        caption = generate_llava_next_caption(model, processor, image, actual_model_name, prompt=prompt)
     elif provider == "blip2":
         model, processor, actual_model_name = load_blip2_model(model_name)
         caption = generate_blip2_caption(model, processor, image, actual_model_name)
@@ -510,11 +513,13 @@ def main():
                         help="Model name or 'auto' for default")
     parser.add_argument("--image", required=True,
                         help="Path to input image")
+    parser.add_argument("--prompt", default=None,
+                        help="Optional caption instruction")
     
     args = parser.parse_args()
     
     try:
-        result = generate_caption(args.provider, args.model, args.image)
+        result = generate_caption(args.provider, args.model, args.image, prompt=args.prompt)
         print(json.dumps(result))
     except Exception as e:
         logger.error(f"Caption generation failed: {e}")
