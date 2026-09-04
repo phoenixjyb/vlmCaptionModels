@@ -544,6 +544,16 @@ def generate_qwen2vl_caption(image: Image.Image, prompt: str | None = None) -> s
         raise
 
 
+def build_translation_prompt(text: str, source_lang: str, target_lang: str, style: str) -> str:
+    return (
+        f"Translate the following {source_lang} {style} faithfully and completely into natural {target_lang}. "
+        "Preserve exactly the visible facts in the source. Do not add guesses, uncertainty, intent, device-use "
+        "activities, gender, sensitive traits, or any detail absent from the source. Use neutral wording equivalent "
+        "to person, adult, or child. Return only the translated text without labels or explanations.\n\n"
+        f"{text}"
+    )
+
+
 def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", target_lang: str = "zh-CN", style: str = "caption") -> str:
     """Translate caption text with Qwen VL in text-only mode."""
     import torch
@@ -554,11 +564,7 @@ def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", t
 
     max_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_MAX_NEW_TOKENS", "160") or "160"))
     retry_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_OOM_RETRY_TOKENS", "96") or "96"))
-    prompt = (
-        f"Translate the following {source_lang} {style} into natural {target_lang}. "
-        "Return only the translated text without explanations.\n\n"
-        f"{clean_text}"
-    )
+    prompt = build_translation_prompt(clean_text, source_lang, target_lang, style)
 
     def _run_once(tokens: int) -> str:
         model_info = load_qwen2vl_model()

@@ -1,4 +1,4 @@
-from caption_server import compose_bilingual_caption
+from caption_server import build_translation_prompt, compose_bilingual_caption
 
 
 PROMPT = 'Return exactly EN: ... followed by a blank line and ZH-CN: ...'
@@ -44,3 +44,13 @@ def test_non_bilingual_request_is_unchanged():
     assert result == 'A concise caption.'
     assert composed is False
     assert calls == []
+
+
+def test_translation_prompt_forbids_added_inference():
+    prompt = build_translation_prompt('A person holds a phone.', 'en', 'zh-CN', 'photo caption')
+
+    assert 'faithfully and completely' in prompt
+    assert 'Do not add guesses' in prompt
+    assert 'device-use activities' in prompt
+    assert 'person, adult, or child' in prompt
+    assert prompt.endswith('A person holds a phone.')
