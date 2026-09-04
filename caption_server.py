@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from PIL import Image
 import io
 import os
+import re
 
 # Help reduce CUDA memory fragmentation for long-running caption workloads.
 if not os.getenv("PYTORCH_CUDA_ALLOC_CONF"):
@@ -68,6 +69,10 @@ _gpu_device = None
 _active_provider = os.getenv("CAPTION_HTTP_PROVIDER", "qwen3-vl").lower()
 _active_model_name = os.getenv("CAPTION_HTTP_MODEL", "auto")
 _caption_semaphore = asyncio.Semaphore(_caption_max_concurrency)
+BILINGUAL_CAPTION_RE = re.compile(
+    r'^\s*EN:\s*(?P<english>.+?)\s*\r?\n\s*\r?\n\s*ZH-CN:\s*(?P<chinese>.+?)\s*$',
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 class TranslationRequest(BaseModel):
@@ -616,6 +621,38 @@ def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", t
             return _run_once(min(max_tokens, retry_tokens))
         raise
 
+
+def compose_bilingual_caption(
+    caption: str,
+    prompt: str | None,
+    translator,
+) -> tuple[str, bool]:
+    """Return a canonical bilingual envelope when the request requires one."""
+    raw = str(caption or '').strip()
+    if not prompt or 'ZH-CN: ...' not in prompt:
+        return raw, False
+
+    exact = BILINGUAL_CAPTION_RE.fullmatch(raw)
+    if exact:
+        return f"EN: {exact.group('english').strip()}\n\nZH-CN: {exact.group('chinese').strip()}", False
+
+    english = raw[3:].strip() if raw.upper().startswith('EN:') else raw
+    marker = re.search(r'\bZH-CN:\s*', english, flags=re.IGNORECASE)
+    if marker:
+        chinese = english[marker.end():].strip()
+        english = english[:marker.start()].strip()
+        if english and chinese:
+            return f'EN: {english}\n\nZH-CN: {chinese}', False
+    if not english:
+        return raw, False
+
+    chinese = str(translator(english) or '').strip().strip('"').strip()
+    if chinese.upper().startswith('ZH-CN:'):
+        chinese = chinese[6:].strip()
+    if not chinese:
+        return raw, False
+    return f'EN: {english}\n\nZH-CN: {chinese}', True
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize the service on startup."""
@@ -664,8 +701,19 @@ async def generate_caption_endpoint(
         
         async with _caption_semaphore:
             start_time = time.time()
+            bilingual_composed = False
             if _is_qwen_provider(_active_provider):
                 caption = generate_qwen2vl_caption(image, prompt=prompt)
+                caption, bilingual_composed = compose_bilingual_caption(
+                    caption,
+                    prompt,
+                    lambda english: generate_qwen_translation(
+                        english,
+                        source_lang='en',
+                        target_lang='zh-CN',
+                        style='photo caption',
+                    ),
+                )
                 model_name = _model_cache.get("qwen-vl", {}).get("model_name", resolve_qwen_model_name(_active_model_name, _active_provider))
             else:
                 caption = generate_blip2_caption(image)
@@ -676,6 +724,7 @@ async def generate_caption_endpoint(
             "caption": caption,
             "model": model_name,
             "provider": _active_provider,
+            "bilingual_composed": bilingual_composed,
             "generation_time_seconds": round(generation_time, 2),
             "device": f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu"
         }
