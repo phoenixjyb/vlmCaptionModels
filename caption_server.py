@@ -69,6 +69,8 @@ _gpu_device = None
 _active_provider = os.getenv("CAPTION_HTTP_PROVIDER", "qwen3-vl").lower()
 _active_model_name = os.getenv("CAPTION_HTTP_MODEL", "auto")
 _caption_semaphore = asyncio.Semaphore(_caption_max_concurrency)
+_active_inference_requests = 0
+_waiting_inference_requests = 0
 BILINGUAL_CAPTION_RE = re.compile(
     r'^\s*EN:\s*(?P<english>.+?)\s*\r?\n\s*\r?\n\s*ZH-CN:\s*(?P<chinese>.+?)\s*$',
     flags=re.DOTALL | re.IGNORECASE,
@@ -659,6 +661,33 @@ def compose_bilingual_caption(
         return raw, False
     return f'EN: {english}\n\nZH-CN: {chinese}', True
 
+
+async def run_serialized_inference(func, *args, **kwargs):
+    """Run blocking model work off the event loop while preserving GPU limits."""
+    global _active_inference_requests, _waiting_inference_requests
+
+    acquired = False
+    _waiting_inference_requests += 1
+    try:
+        await _caption_semaphore.acquire()
+        acquired = True
+        _waiting_inference_requests -= 1
+        _active_inference_requests += 1
+        work = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # A cancelled HTTP request cannot stop the underlying model thread.
+            # Keep the GPU slot until that work really finishes.
+            await work
+            raise
+    finally:
+        if acquired:
+            _active_inference_requests -= 1
+            _caption_semaphore.release()
+        else:
+            _waiting_inference_requests -= 1
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize the service on startup."""
@@ -705,7 +734,7 @@ async def generate_caption_endpoint(
         image_data = await file.read()
         image = Image.open(io.BytesIO(image_data)).convert('RGB')
         
-        async with _caption_semaphore:
+        def generate_caption():
             start_time = time.time()
             bilingual_composed = False
             if _is_qwen_provider(_active_provider):
@@ -725,6 +754,12 @@ async def generate_caption_endpoint(
                 caption = generate_blip2_caption(image)
                 model_name = "blip2-opt-2.7b"
             generation_time = time.time() - start_time
+
+            return caption, bilingual_composed, model_name, generation_time
+
+        caption, bilingual_composed, model_name, generation_time = await run_serialized_inference(
+            generate_caption
+        )
         
         return {
             "caption": caption,
@@ -749,7 +784,7 @@ async def translate_text_endpoint(req: TranslationRequest):
     if not _is_qwen_provider(_active_provider):
         raise HTTPException(status_code=400, detail="Translation requires qwen provider")
     try:
-        async with _caption_semaphore:
+        def translate_text():
             start_time = time.time()
             translated = generate_qwen_translation(
                 req.text,
@@ -760,6 +795,9 @@ async def translate_text_endpoint(req: TranslationRequest):
             generation_time = time.time() - start_time
             if not translated:
                 raise RuntimeError("Empty translation output")
+            return translated, generation_time
+
+        translated, generation_time = await run_serialized_inference(translate_text)
         return {
             "translation": translated,
             "source_lang": req.source_lang,
@@ -807,7 +845,11 @@ async def health_check():
             "gpu_allocated_bytes": gpu_allocated_bytes,
             "gpu_reserved_bytes": gpu_reserved_bytes,
             "current_device": f"cuda:{_gpu_device}" if _gpu_device is not None else "cpu",
-            "model_cache_ready": model_loaded
+            "model_cache_ready": model_loaded,
+            "inference_busy": _active_inference_requests > 0,
+            "inference_active_requests": _active_inference_requests,
+            "inference_waiting_requests": _waiting_inference_requests,
+            "inference_max_concurrency": _caption_max_concurrency,
         }
         
     except Exception as e:
