@@ -75,6 +75,12 @@ BILINGUAL_CAPTION_RE = re.compile(
     r'^\s*EN:\s*(?P<english>.+?)\s*\r?\n\s*\r?\n\s*ZH-CN:\s*(?P<chinese>.+?)\s*$',
     flags=re.DOTALL | re.IGNORECASE,
 )
+SUPPORTED_TRANSLATION_AVOID_TERMS = frozenset({
+    "似乎", "好像", "可能", "看起来", "大概", "或许", "推测",
+    "拍摄", "拍照", "录像", "录制",
+    "男人", "女人", "男子", "女子", "男孩", "女孩", "男性", "女性",
+    "裸体", "赤裸", "尿布", "内衣", "没穿衣服",
+})
 
 
 class TranslationRequest(BaseModel):
@@ -82,6 +88,7 @@ class TranslationRequest(BaseModel):
     source_lang: str = Field(default="en")
     target_lang: str = Field(default="zh-CN")
     style: str = Field(default="caption")
+    avoid_terms: list[str] = Field(default_factory=list)
 
 app = FastAPI(title="Caption Models Service", version="1.0.0")
 
@@ -546,17 +553,48 @@ def generate_qwen2vl_caption(image: Image.Image, prompt: str | None = None) -> s
         raise
 
 
-def build_translation_prompt(text: str, source_lang: str, target_lang: str, style: str) -> str:
+def _supported_avoid_terms(avoid_terms: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Keep translation constraints bounded to the service's reviewed policy vocabulary."""
+    result = []
+    for raw_term in avoid_terms or ():
+        term = str(raw_term or "").strip()
+        if term in SUPPORTED_TRANSLATION_AVOID_TERMS and term not in result:
+            result.append(term)
+    return result
+
+
+def build_translation_prompt(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    style: str,
+    avoid_terms: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    supported_terms = _supported_avoid_terms(avoid_terms)
+    avoid_instruction = ""
+    if supported_terms:
+        avoid_instruction = (
+            " Do not use any of these exact target-language terms: "
+            + "、".join(supported_terms)
+            + ". Express the same visible facts with neutral wording instead."
+        )
     return (
         f"Translate the following {source_lang} {style} faithfully and completely into natural {target_lang}. "
         "Preserve exactly the visible facts in the source. Do not add guesses, uncertainty, intent, device-use "
         "activities, gender, sensitive traits, or any detail absent from the source. Use neutral wording equivalent "
-        "to person, adult, or child. Return only the translated text without labels or explanations.\n\n"
+        f"to person, adult, or child.{avoid_instruction} "
+        "Return only the translated text without labels or explanations.\n\n"
         f"{text}"
     )
 
 
-def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", target_lang: str = "zh-CN", style: str = "caption") -> str:
+def generate_qwen_translation(
+    text_to_translate: str,
+    source_lang: str = "en",
+    target_lang: str = "zh-CN",
+    style: str = "caption",
+    avoid_terms: list[str] | tuple[str, ...] | None = None,
+) -> str:
     """Translate caption text with Qwen VL in text-only mode."""
     import torch
 
@@ -566,7 +604,13 @@ def generate_qwen_translation(text_to_translate: str, source_lang: str = "en", t
 
     max_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_MAX_NEW_TOKENS", "160") or "160"))
     retry_tokens = max(24, int(os.getenv("QWEN_TRANSLATE_OOM_RETRY_TOKENS", "96") or "96"))
-    prompt = build_translation_prompt(clean_text, source_lang, target_lang, style)
+    prompt = build_translation_prompt(
+        clean_text,
+        source_lang,
+        target_lang,
+        style,
+        avoid_terms=avoid_terms,
+    )
 
     def _run_once(tokens: int) -> str:
         model_info = load_qwen2vl_model()
@@ -791,6 +835,7 @@ async def translate_text_endpoint(req: TranslationRequest):
                 source_lang=req.source_lang,
                 target_lang=req.target_lang,
                 style=req.style,
+                avoid_terms=req.avoid_terms,
             )
             generation_time = time.time() - start_time
             if not translated:
