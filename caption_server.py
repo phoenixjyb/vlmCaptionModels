@@ -597,6 +597,32 @@ def translation_avoid_matches(
     return [term for term in supported_terms if term in str(translated_text or "")]
 
 
+def translation_bad_words_ids(
+    processor,
+    avoid_terms: list[str] | tuple[str, ...] | None,
+) -> list[list[int]]:
+    """Encode reviewed terms for decoder-level exclusion during translation."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        return []
+
+    result: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for term in _supported_avoid_terms(avoid_terms):
+        # Include both bare and word-boundary variants because BPE tokenization can differ by context.
+        for variant in (term, f" {term}"):
+            try:
+                token_ids = [int(token_id) for token_id in encode(variant, add_special_tokens=False)]
+            except Exception:
+                continue
+            key = tuple(token_ids)
+            if key and key not in seen:
+                seen.add(key)
+                result.append(token_ids)
+    return result
+
+
 def build_translation_correction_prompt(
     source_text: str,
     rejected_translation: str,
@@ -665,9 +691,13 @@ def generate_qwen_translation(
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[rendered], padding=True, return_tensors="pt")
         inputs = inputs.to(model.device)
+        generation_kwargs = {"max_new_tokens": tokens}
+        bad_words_ids = translation_bad_words_ids(processor, avoid_terms)
+        if bad_words_ids:
+            generation_kwargs["bad_words_ids"] = bad_words_ids
         try:
             with torch.inference_mode():
-                generated_ids = model.generate(**inputs, max_new_tokens=tokens)
+                generated_ids = model.generate(**inputs, **generation_kwargs)
             if hasattr(generated_ids, "ndim") and generated_ids.ndim == 1:
                 generated_ids = generated_ids.unsqueeze(0)
             trimmed = []

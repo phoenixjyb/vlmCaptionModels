@@ -2,6 +2,7 @@ from caption_server import (
     build_translation_correction_prompt,
     build_translation_prompt,
     compose_bilingual_caption,
+    translation_bad_words_ids,
     translation_avoid_matches,
 )
 
@@ -82,6 +83,30 @@ def test_translation_avoid_matches_returns_only_reviewed_requested_terms():
     )
 
     assert matches == ['拍摄', '可能']
+
+
+def test_translation_bad_words_ids_encodes_reviewed_terms_and_boundary_variants():
+    class FakeTokenizer:
+        mapping = {
+            '拍摄': [10, 11],
+            ' 拍摄': [20, 10, 11],
+            '可能': [30],
+            ' 可能': [40, 30],
+        }
+
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return self.mapping[text]
+
+    class FakeProcessor:
+        tokenizer = FakeTokenizer()
+
+    result = translation_bad_words_ids(
+        FakeProcessor(),
+        ['拍摄', '可能', 'not reviewed', '拍摄'],
+    )
+
+    assert result == [[10, 11], [20, 10, 11], [30], [40, 30]]
 
 
 def test_translation_correction_prompt_targets_only_terms_that_remain():
